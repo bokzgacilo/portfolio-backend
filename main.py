@@ -60,16 +60,20 @@ ALLOWED_ORIGINS = [
     origin.strip()
     for origin in os.getenv(
         "ALLOWED_ORIGINS",
-        "http://localhost:3000,http://127.0.0.1:3000,https://www.bokzgacilo.com,https://bokzgacilo.com",
+        "https://www.bokzgacilo.com,https://bokzgacilo.com",
     ).split(",")
     if origin.strip()
 ]
 
-# Every Vercel preview deployment gets its own hostname, so an allowlist of
-# literal origins can never keep up with them.
-ALLOWED_ORIGIN_REGEX = os.getenv(
-    "ALLOWED_ORIGIN_REGEX", r"https://.*\.vercel\.app"
-)
+# Blank by default so production only accepts the literal domains above. Set
+# this explicitly in local/dev environments if preview origins are needed.
+ALLOWED_ORIGIN_REGEX = os.getenv("ALLOWED_ORIGIN_REGEX") or None
+
+STRICT_ORIGIN_CHECK = os.getenv("STRICT_ORIGIN_CHECK", "1").lower() not in {
+    "0",
+    "false",
+    "no",
+}
 
 # --------------------------------------------------------------------------- #
 # App                                                                         #
@@ -115,6 +119,16 @@ app.add_middleware(
         "X-Downscaled",
     ],
 )
+
+
+@app.middleware("http")
+async def enforce_api_origin(request, call_next):
+    if STRICT_ORIGIN_CHECK and request.url.path == "/api/remove-background":
+        origin = request.headers.get("origin")
+        if origin not in ALLOWED_ORIGINS:
+            return JSONResponse(status_code=403, content={"error": "Origin not allowed."})
+
+    return await call_next(request)
 
 
 @app.get("/")

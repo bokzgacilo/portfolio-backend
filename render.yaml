@@ -29,6 +29,10 @@ services:
         value: "10485760"
       - key: MAX_DIMENSION
         value: "2000"
-      # Set this to the Vercel production domains that may call the API.
+      # Production API accepts only the public site origins.
       - key: ALLOWED_ORIGINS
-        value: https://www.bokzgacilo.com,https://bokzgacilo.com,http://localhost:3000,http://127.0.0.1:3000
+        value: https://www.bokzgacilo.com,https://bokzgacilo.com
+      - key: ALLOWED_ORIGIN_REGEX
+        value: ""
+      - key: STRICT_ORIGIN_CHECK
+        value: "1"

@@ -52,8 +52,9 @@ Every variable has a working default; none are required.
 | `REMBG_MODEL`         | `u2netp`                               | `isnet-general-use` or `u2net` for better edges (more RAM) |
 | `MAX_UPLOAD_BYTES`    | `10485760` (10 MB)                     | Rejected with `413` above this                            |
 | `MAX_DIMENSION`       | `2000`                                 | Longest edge; larger inputs are downscaled first          |
-| `ALLOWED_ORIGINS`     | localhost:3000 + the production domains | Comma-separated                                          |
-| `ALLOWED_ORIGIN_REGEX`| `https://.*\.vercel\.app`              | Matches Vercel preview deployments                        |
+| `ALLOWED_ORIGINS`     | production domains only                 | Comma-separated                                          |
+| `ALLOWED_ORIGIN_REGEX`| empty                                   | Optional regex for non-production preview origins         |
+| `STRICT_ORIGIN_CHECK` | `1`                                     | Rejects `/api/remove-background` when `Origin` is not allowed |
 | `REMBG_HOME`          | `~/.rembg`                             | Where model files are cached                              |
 
 ## Run locally
@@ -103,7 +104,7 @@ No blueprint? Create a Python **Web Service** by hand with:
 - Start: `uvicorn main:app --host 0.0.0.0 --port $PORT --workers 1`
 - Health check path: `/health`
 
-Once it is live, set `ALLOWED_ORIGINS` to your Vercel domains and add the
+Once it is live, set `ALLOWED_ORIGINS` to the production domains and add the
 service URL to Vercel as `NEXT_PUBLIC_BACKGROUND_REMOVER_API`.
 
 ### Free-tier realities

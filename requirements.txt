@@ -1,0 +1,9 @@
+# Pinned so a Render redeploy cannot pick up a breaking release on its own.
+fastapi==0.128.8
+uvicorn[standard]==0.39.0
+python-multipart==0.0.20
+pillow==11.3.0
+
+# rembg brings the ONNX model plumbing; onnxruntime is the CPU inference engine.
+rembg==2.0.61
+onnxruntime==1.19.2

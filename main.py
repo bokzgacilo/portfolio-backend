@@ -17,12 +17,17 @@ import os
 import time
 from contextlib import asynccontextmanager
 
+os.environ.setdefault("NUMBA_CACHE_DIR", "/tmp/numba-cache")
+
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 from PIL import Image, ImageOps, UnidentifiedImageError
+from pillow_heif import register_heif_opener
 from rembg import new_session, remove
+
+register_heif_opener()
 
 # --------------------------------------------------------------------------- #
 # Configuration                                                               #
@@ -54,13 +59,25 @@ ALLOWED_CONTENT_TYPES = {
     "image/webp",
 }
 
+CONVERT_ALLOWED_CONTENT_TYPES = ALLOWED_CONTENT_TYPES | {
+    "image/avif",
+    "image/heic",
+    "image/heif",
+}
+
+CONVERT_OUTPUT_TYPES = {
+    "image/png": ("PNG", "png"),
+    "image/jpeg": ("JPEG", "jpg"),
+    "image/webp": ("WEBP", "webp"),
+}
+
 # Comma-separated list. The defaults cover local Next dev and the production
 # site; Vercel preview URLs are matched by the regex below instead.
 ALLOWED_ORIGINS = [
     origin.strip()
     for origin in os.getenv(
         "ALLOWED_ORIGINS",
-        "https://www.bokzgacilo.com,https://bokzgacilo.com",
+        "https://www.bokzgacilo.com,https://bokzgacilo.com,http://localhost:3000,http://127.0.0.1:3000",
     ).split(",")
     if origin.strip()
 ]
@@ -84,12 +101,22 @@ STRICT_ORIGIN_CHECK = os.getenv("STRICT_ORIGIN_CHECK", "1").lower() not in {
 # first traffic only after startup finishes, so paying the cost here means the
 # first real request is not the one that waits.
 _session = None
+_session_error = None
+
+
+def _load_session():
+    return new_session(MODEL_NAME, providers=["CPUExecutionProvider"])
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    global _session
-    _session = new_session(MODEL_NAME)
+    global _session, _session_error
+    try:
+        _session = _load_session()
+        _session_error = None
+    except Exception as cause:
+        _session = None
+        _session_error = str(cause)
     yield
     _session = None
 
@@ -117,13 +144,16 @@ app.add_middleware(
         "X-Output-Width",
         "X-Output-Height",
         "X-Downscaled",
+        "X-Source-Format",
+        "X-Output-Format",
     ],
 )
 
 
 @app.middleware("http")
 async def enforce_api_origin(request, call_next):
-    if STRICT_ORIGIN_CHECK and request.url.path == "/api/remove-background":
+    protected_paths = {"/api/remove-background", "/api/convert-image"}
+    if STRICT_ORIGIN_CHECK and request.url.path in protected_paths:
         origin = request.headers.get("origin")
         if origin not in ALLOWED_ORIGINS:
             return JSONResponse(status_code=403, content={"error": "Origin not allowed."})
@@ -136,11 +166,17 @@ def root():
     return {
         "service": "background-remover",
         "model": MODEL_NAME,
-        "endpoints": {"health": "GET /health", "remove": "POST /api/remove-background"},
+        "endpoints": {
+            "health": "GET /health",
+            "remove": "POST /api/remove-background",
+            "convert": "POST /api/convert-image",
+        },
         "limits": {
             "maxUploadBytes": MAX_UPLOAD_BYTES,
             "maxDimension": MAX_DIMENSION,
             "acceptedTypes": sorted(ALLOWED_CONTENT_TYPES),
+            "convertAcceptedTypes": sorted(CONVERT_ALLOWED_CONTENT_TYPES),
+            "convertOutputTypes": sorted(CONVERT_OUTPUT_TYPES),
         },
     }
 
@@ -149,13 +185,108 @@ def root():
 def health():
     """Cheap and side-effect free. The frontend pings this to wake a sleeping
     free-tier instance before the visitor has picked a file."""
-    return {"status": "ok", "model": MODEL_NAME, "ready": _session is not None}
+    return {
+        "status": "ok",
+        "model": MODEL_NAME,
+        "ready": _session is not None,
+        "backgroundRemovalError": _session_error,
+    }
+
+
+@app.post("/api/convert-image")
+async def convert_image(file: UploadFile = File(...), target: str = "image/png"):
+    content_type = (file.content_type or "").lower()
+    if content_type not in CONVERT_ALLOWED_CONTENT_TYPES:
+        raise HTTPException(
+            status_code=415,
+            detail=(
+                f"Unsupported type: {content_type or 'unknown'}. "
+                "Send a JPG, PNG, WebP, AVIF, HEIC, or HEIF image."
+            ),
+        )
+
+    target = target.lower()
+    if target not in CONVERT_OUTPUT_TYPES:
+        raise HTTPException(
+            status_code=415,
+            detail="Choose PNG, JPEG, or WebP as the target format.",
+        )
+
+    data = await file.read()
+    if not data:
+        raise HTTPException(status_code=400, detail="The uploaded file was empty.")
+    if len(data) > MAX_UPLOAD_BYTES:
+        limit_mb = MAX_UPLOAD_BYTES / (1024 * 1024)
+        raise HTTPException(
+            status_code=413,
+            detail=f"That file is larger than the {limit_mb:.0f} MB limit.",
+        )
+
+    try:
+        source = Image.open(io.BytesIO(data))
+        source.load()
+    except (UnidentifiedImageError, OSError):
+        raise HTTPException(status_code=400, detail="That file is not a readable image.")
+
+    source = ImageOps.exif_transpose(source)
+    original_width, original_height = source.size
+
+    output_format, extension = CONVERT_OUTPUT_TYPES[target]
+    if target == "image/jpeg":
+        image = source.convert("RGBA")
+        background = Image.new("RGBA", image.size, (255, 255, 255, 255))
+        background.alpha_composite(image)
+        output = background.convert("RGB")
+    elif target == "image/png":
+        output = source.convert("RGBA")
+    else:
+        output = source.convert("RGBA" if source.mode in {"RGBA", "LA"} else "RGB")
+
+    started = time.perf_counter()
+    buffer = io.BytesIO()
+    save_kwargs = {"optimize": True}
+    if target in {"image/jpeg", "image/webp"}:
+        save_kwargs["quality"] = 92
+    output.save(buffer, format=output_format, **save_kwargs)
+    elapsed_ms = int((time.perf_counter() - started) * 1000)
+    payload = buffer.getvalue()
+
+    base_name = (file.filename or "image").rsplit(".", 1)[0] or "image"
+    safe_name = "".join(
+        character if character.isalnum() or character in {"-", "_"} else "-"
+        for character in base_name[:80]
+    ).strip("-") or "image"
+
+    return Response(
+        content=payload,
+        media_type=target,
+        headers={
+            "X-Processing-Ms": str(elapsed_ms),
+            "X-Original-Width": str(original_width),
+            "X-Original-Height": str(original_height),
+            "X-Output-Width": str(output.width),
+            "X-Output-Height": str(output.height),
+            "X-Source-Format": content_type,
+            "X-Output-Format": target,
+            "Content-Disposition": f'inline; filename="{safe_name}.{extension}"',
+            "Cache-Control": "no-store",
+        },
+    )
 
 
 @app.post("/api/remove-background")
 async def remove_background(file: UploadFile = File(...)):
-    if _session is None:  # pragma: no cover - startup ran, so this is defensive
-        raise HTTPException(status_code=503, detail="Model is still loading.")
+    global _session, _session_error
+    if _session is None:
+        try:
+            _session = _load_session()
+            _session_error = None
+        except Exception as cause:
+            _session_error = str(cause)
+            raise HTTPException(
+                status_code=503,
+                detail="Background-removal model is unavailable right now.",
+            )
 
     content_type = (file.content_type or "").lower()
     if content_type not in ALLOWED_CONTENT_TYPES:

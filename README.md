@@ -117,3 +117,48 @@ service URL to Vercel as `NEXT_PUBLIC_BACKGROUND_REMOVER_API`.
   downscale. `u2net` (~176 MB) and the BiRefNet models want a paid instance.
 - **Ephemeral disk.** Model files are re-downloaded on each deploy, which is
   why the build command warms the cache instead of the first request.
+
+## Deploy updates on the Bluehost VPS
+
+The backend is checked out at `/opt/api`. After the deployment script has been
+committed and pushed to the backend repository, get it once on the VPS:
+
+```bash
+cd /opt/api
+git pull --ff-only
+```
+
+Then deploy with one command, from any directory:
+
+```bash
+bash /opt/api/deploy.sh
+```
+
+The script pulls the current branch's upstream with `--ff-only`, installs pinned
+requirements into the existing virtualenv, checks dependency consistency and
+Python syntax, restarts the backend, waits for local model readiness, restarts
+`cloudflared`, and waits for the public HTTPS health endpoint to report
+`status: ok` and `ready: true`. A deployment lock prevents concurrent runs.
+
+It restarts `bok-api.service`, the backend service on this VPS.
+If your service name changes or your virtualenv lives elsewhere, configure once:
+
+```bash
+cp /opt/api/.deploy.conf.example /opt/api/.deploy.conf
+nano /opt/api/.deploy.conf
+```
+
+Set `API_SERVICE` to the backend's service name and `PYTHON_BIN` to the exact
+virtualenv Python used by that service. `.deploy.conf` is ignored by Git.
+No API or Cloudflare token is needed: the existing services retain their settings.
+Run as the repository owner with sudo access, or as root if root owns this checkout.
+
+The script refuses tracked local edits, detached HEADs, missing upstreams, missing
+services, and system Python. If dependencies fail, it does not restart services.
+If local readiness fails, it does not restart the tunnel. Later failures exit
+nonzero and print diagnostic commands. Pulling and installing modify the checkout
+and environment in place; failures do not automatically roll them back. Restarting
+can interrupt in-flight requests, so use a quiet moment for updates.
+
+This is a manually triggered deployment command, not a push-triggered CI pipeline.
+It does not upgrade the VPS operating system or the `cloudflared` binary.

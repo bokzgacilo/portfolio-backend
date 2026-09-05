@@ -6,3 +6,6 @@ venv/
 .rembg/
 .u2net/
 .DS_Store
+
+# VPS-only deployment settings
+.deploy.conf

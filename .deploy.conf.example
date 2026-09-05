@@ -1,0 +1,14 @@
+# Copy to .deploy.conf on the VPS only if the defaults need overriding.
+# The file is sourced as shell code; keep it writable only by trusted deployers.
+
+# Backend systemd service name supplied for this VPS.
+API_SERVICE=bok-api.service
+
+# Must be the SAME virtualenv Python used by the backend service.
+# Defaults to /opt/api/.venv/bin/python, then /opt/api/venv/bin/python.
+# PYTHON_BIN=/opt/api/.venv/bin/python
+
+CLOUDFLARED_SERVICE=cloudflared.service
+LOCAL_HEALTH_URL=http://127.0.0.1:8000/health
+PUBLIC_HEALTH_URL=https://api.bokzgacilo.com/health
+HEALTH_TIMEOUT=180

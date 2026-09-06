@@ -1,6 +1,7 @@
 import os
 import tempfile
 import unittest
+import importlib
 from pathlib import Path
 
 
@@ -11,7 +12,7 @@ class StatisticsStorageTests(unittest.TestCase):
         os.environ["STATISTICS_DB_PATH"] = str(Path(cls.directory.name) / "statistics.sqlite3")
         import main
 
-        cls.main = main
+        cls.main = importlib.reload(main)
         main._init_statistics_db()
 
     @classmethod

@@ -13,13 +13,19 @@ Run on Render: uvicorn main:app --host 0.0.0.0 --port $PORT
 from __future__ import annotations
 
 import io
+import json
 import os
+import re
+import sqlite3
 import time
+import zipfile
 from contextlib import asynccontextmanager
+from pathlib import Path
+from uuid import UUID
 
 os.environ.setdefault("NUMBA_CACHE_DIR", "/tmp/numba-cache")
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
@@ -92,6 +98,200 @@ STRICT_ORIGIN_CHECK = os.getenv("STRICT_ORIGIN_CHECK", "1").lower() not in {
     "no",
 }
 
+STATISTICS_DB_PATH = Path(
+    os.getenv("STATISTICS_DB_PATH", str(Path(__file__).resolve().parent / "data" / "statistics.sqlite3"))
+).expanduser()
+
+# These keys are intentionally explicit. A client can report only resources
+# registered here, so random URLs cannot grow the database indefinitely.
+STATISTICS_RESOURCES = (
+    ("tool/audio/audio-clipper", "tool"),
+    ("tool/image/background-remover", "tool"),
+    ("tool/image/image-compressor", "tool"),
+    ("tool/image/image-resizer", "tool"),
+    ("tool/image/image-extension-converter", "tool"),
+    ("tool/converter/pdf-to-image", "tool"),
+    ("tool/data/json-formatter", "tool"),
+    ("tool/data/excel-unlocker", "tool"),
+    ("blog/integrating-salesforce-crm-leads-with-a-next-js-page-router-app-7b29bac20ea9", "blog"),
+)
+
+EXCEL_MAX_UPLOAD_BYTES = _int_env("EXCEL_MAX_UPLOAD_BYTES", 50 * 1024 * 1024)
+EXCEL_EXTENSIONS = {".xlsx", ".xlsm"}
+EXCEL_MEDIA_TYPES = {
+    ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    ".xlsm": "application/vnd.ms-excel.sheet.macroEnabled.12",
+}
+_statistics_error: str | None = None
+
+
+def _statistics_connection() -> sqlite3.Connection:
+    STATISTICS_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(STATISTICS_DB_PATH, timeout=10)
+    connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA busy_timeout=10000")
+    connection.execute("PRAGMA journal_mode=WAL")
+    return connection
+
+
+def _init_statistics_db() -> None:
+    with _statistics_connection() as connection:
+        connection.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS statistic_resources (
+              resource_key TEXT PRIMARY KEY,
+              kind TEXT NOT NULL CHECK (kind IN ('tool', 'blog'))
+            );
+            CREATE TABLE IF NOT EXISTS resource_events (
+              event_id TEXT PRIMARY KEY,
+              resource_key TEXT NOT NULL REFERENCES statistic_resources(resource_key),
+              visitor_id TEXT NOT NULL,
+              event_type TEXT NOT NULL CHECK (event_type IN ('visit', 'complete', 'open')),
+              created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS resource_unique_visit
+              ON resource_events(resource_key, visitor_id) WHERE event_type = 'visit';
+            CREATE INDEX IF NOT EXISTS resource_events_resource_idx
+              ON resource_events(resource_key, visitor_id);
+            CREATE INDEX IF NOT EXISTS resource_events_rate_idx
+              ON resource_events(visitor_id, created_at);
+            """
+        )
+        connection.executemany(
+            "INSERT OR IGNORE INTO statistic_resources(resource_key, kind) VALUES (?, ?)",
+            STATISTICS_RESOURCES,
+        )
+
+
+def _read_statistics() -> list[dict[str, int | str]]:
+    with _statistics_connection() as connection:
+        rows = connection.execute(
+            """
+            SELECT resource_key,
+              COUNT(DISTINCT visitor_id) AS visitors,
+              SUM(CASE WHEN event_type = 'complete' THEN 1 ELSE 0 END) AS completed,
+              SUM(CASE WHEN event_type = 'open' THEN 1 ELSE 0 END) AS opens
+            FROM statistic_resources
+            LEFT JOIN resource_events USING (resource_key)
+            GROUP BY resource_key
+            ORDER BY resource_key
+            """
+        ).fetchall()
+    return [
+        {
+            "resource_key": row["resource_key"],
+            "visitors": int(row["visitors"] or 0),
+            "completed": int(row["completed"] or 0),
+            "opens": int(row["opens"] or 0),
+        }
+        for row in rows
+    ]
+
+
+def _record_statistics_event(resource: str, visitor: str, event_id: str, event: str) -> None:
+    UUID(visitor)
+    UUID(event_id)
+    resource_kind = next((kind for key, kind in STATISTICS_RESOURCES if key == resource), None)
+    if resource_kind is None or (resource_kind == "tool" and event not in {"visit", "complete"}) or (resource_kind == "blog" and event != "open"):
+        raise ValueError("Invalid statistics event")
+    with _statistics_connection() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        if connection.execute("SELECT 1 FROM resource_events WHERE event_id = ?", (event_id,)).fetchone():
+            connection.commit()
+            return
+        if event == "visit" and connection.execute(
+            "SELECT 1 FROM resource_events WHERE resource_key = ? AND visitor_id = ? AND event_type = 'visit'",
+            (resource, visitor),
+        ).fetchone():
+            connection.commit()
+            return
+        recent = connection.execute(
+            "SELECT COUNT(*) FROM resource_events WHERE visitor_id = ? AND created_at >= datetime('now', '-1 day')",
+            (visitor,),
+        ).fetchone()[0]
+        if recent >= 1000:
+            connection.rollback()
+            raise ValueError("Event limit reached")
+        connection.execute(
+            "INSERT INTO resource_events(event_id, resource_key, visitor_id, event_type) VALUES (?, ?, ?, ?)",
+            (event_id, resource, visitor, event),
+        )
+        connection.commit()
+
+
+def _remove_excel_protection(data: bytes) -> bytes:
+    """Remove worksheet and workbook protection from an OOXML workbook.
+
+    The ZIP package is rewritten without changing the other workbook parts,
+    which preserves formulas, styles, charts, and VBA projects in .xlsm files.
+    """
+    source = io.BytesIO(data)
+    if not zipfile.is_zipfile(source):
+        raise ValueError("That file is not a valid Excel workbook.")
+
+    try:
+        from lxml import etree
+    except ImportError as cause:
+        raise RuntimeError("Excel support is not installed on the server.") from cause
+
+    output = io.BytesIO()
+    with zipfile.ZipFile(source, "r") as archive, zipfile.ZipFile(output, "w") as result:
+        for info in archive.infolist():
+            payload = archive.read(info.filename)
+            if info.filename == "xl/workbook.xml" or (
+                info.filename.startswith("xl/worksheets/") and info.filename.endswith(".xml")
+            ):
+                try:
+                    root = etree.fromstring(
+                        payload,
+                        parser=etree.XMLParser(resolve_entities=False, no_network=True),
+                    )
+                    for protected in root.xpath(
+                        "//*[local-name()='workbookProtection' or local-name()='sheetProtection']"
+                    ):
+                        parent = protected.getparent()
+                        if parent is not None:
+                            parent.remove(protected)
+                    payload = etree.tostring(root, xml_declaration=True, encoding="UTF-8", standalone=True)
+                except etree.XMLSyntaxError as cause:
+                    raise ValueError("The workbook contains invalid XML.") from cause
+            result.writestr(info, payload)
+    return output.getvalue()
+
+
+def _excel_sheet_counts(data: bytes) -> tuple[int, int, int]:
+    """Return total, protected, and unprotected worksheet counts."""
+    from lxml import etree
+
+    total = 0
+    locked = 0
+    with zipfile.ZipFile(io.BytesIO(data), "r") as archive:
+        worksheet_names = [name for name in archive.namelist() if name.startswith("xl/worksheets/") and name.endswith(".xml")]
+        if "xl/workbook.xml" in archive.namelist():
+            workbook = etree.fromstring(archive.read("xl/workbook.xml"))
+            total = len(workbook.xpath("//*[local-name()='sheets']/*[local-name()='sheet']"))
+        for name in worksheet_names:
+            worksheet = etree.fromstring(archive.read(name))
+            if worksheet.xpath("boolean(.//*[local-name()='sheetProtection'])"):
+                locked += 1
+    total = max(total, len(worksheet_names))
+    return total, locked, max(total - locked, 0)
+
+
+def _decrypt_excel(data: bytes, password: str) -> bytes:
+    try:
+        import msoffcrypto
+    except ImportError as cause:
+        raise RuntimeError("Excel encryption support is not installed on the server.") from cause
+    try:
+        office_file = msoffcrypto.OfficeFile(io.BytesIO(data))
+        office_file.load_key(password=password)
+        output = io.BytesIO()
+        office_file.decrypt(output)
+        return output.getvalue()
+    except Exception as cause:
+        raise ValueError("The password is incorrect or the workbook could not be decrypted.") from cause
+
 # --------------------------------------------------------------------------- #
 # App                                                                         #
 # --------------------------------------------------------------------------- #
@@ -110,7 +310,12 @@ def _load_session():
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    global _session, _session_error
+    global _session, _session_error, _statistics_error
+    try:
+        _init_statistics_db()
+        _statistics_error = None
+    except Exception as cause:
+        _statistics_error = str(cause)
     try:
         _session = _load_session()
         _session_error = None
@@ -146,13 +351,21 @@ app.add_middleware(
         "X-Downscaled",
         "X-Source-Format",
         "X-Output-Format",
+        "X-Excel-Total-Sheets",
+        "X-Excel-Locked-Sheets",
+        "X-Excel-Unlocked-Sheets",
     ],
 )
 
 
 @app.middleware("http")
 async def enforce_api_origin(request, call_next):
-    protected_paths = {"/api/remove-background", "/api/convert-image"}
+    protected_paths = {
+        "/api/remove-background",
+        "/api/convert-image",
+        "/api/statistics",
+        "/api/unlock-excel",
+    }
     if STRICT_ORIGIN_CHECK and request.url.path in protected_paths:
         origin = request.headers.get("origin")
         if origin not in ALLOWED_ORIGINS:
@@ -168,8 +381,10 @@ def root():
         "model": MODEL_NAME,
         "endpoints": {
             "health": "GET /health",
+            "statistics": "GET/POST /api/statistics",
             "remove": "POST /api/remove-background",
             "convert": "POST /api/convert-image",
+            "unlockExcel": "POST /api/unlock-excel",
         },
         "limits": {
             "maxUploadBytes": MAX_UPLOAD_BYTES,
@@ -177,6 +392,8 @@ def root():
             "acceptedTypes": sorted(ALLOWED_CONTENT_TYPES),
             "convertAcceptedTypes": sorted(CONVERT_ALLOWED_CONTENT_TYPES),
             "convertOutputTypes": sorted(CONVERT_OUTPUT_TYPES),
+            "excelMaxUploadBytes": EXCEL_MAX_UPLOAD_BYTES,
+            "excelExtensions": sorted(EXCEL_EXTENSIONS),
         },
     }
 
@@ -190,9 +407,79 @@ def health():
         "model": MODEL_NAME,
         "ready": _session is not None,
         "backgroundRemovalError": _session_error,
+        "statisticsReady": _statistics_error is None,
     }
 
 
+@app.get("/api/statistics")
+def read_statistics():
+    if _statistics_error is not None:
+        return JSONResponse(status_code=503, content={"error": "Statistics storage is unavailable."})
+    try:
+        return {"stats": _read_statistics()}
+    except sqlite3.Error:
+        return JSONResponse(status_code=503, content={"error": "Statistics storage is unavailable."})
+
+
+@app.post("/api/statistics", status_code=204)
+async def record_statistics(request: Request):
+    if _statistics_error is not None:
+        return JSONResponse(status_code=503, content={"error": "Statistics storage is unavailable."})
+    try:
+        body = json.loads((await request.body()).decode("utf-8"))
+        if not isinstance(body, dict) or len(json.dumps(body)) > 1024:
+            raise ValueError("Invalid event")
+        resource, visitor, event_id, event = (body.get(name) for name in ("resource", "visitor", "eventId", "event"))
+        if not all(isinstance(value, str) for value in (resource, visitor, event_id, event)):
+            raise ValueError("Invalid event")
+        _record_statistics_event(resource, visitor, event_id, event)
+        return Response(status_code=204)
+    except (ValueError, TypeError, json.JSONDecodeError):
+        return JSONResponse(status_code=400, content={"error": "Invalid statistics event."})
+    except sqlite3.Error:
+        return JSONResponse(status_code=503, content={"error": "Statistics storage is unavailable."})
+
+
+@app.post("/api/unlock-excel")
+async def unlock_excel(file: UploadFile = File(...), password: str = Form("")):
+    """Return a copy of an XLSX/XLSM workbook with protection removed."""
+    original_name = file.filename or "workbook.xlsx"
+    suffix = Path(original_name).suffix.lower()
+    if suffix not in EXCEL_EXTENSIONS:
+        raise HTTPException(status_code=415, detail="Upload an .xlsx or .xlsm workbook.")
+
+    data = await file.read()
+    if not data:
+        raise HTTPException(status_code=400, detail="The uploaded workbook was empty.")
+    if len(data) > EXCEL_MAX_UPLOAD_BYTES:
+        limit_mb = EXCEL_MAX_UPLOAD_BYTES / (1024 * 1024)
+        raise HTTPException(status_code=413, detail=f"That workbook is larger than the {limit_mb:.0f} MB limit.")
+
+    try:
+        if not zipfile.is_zipfile(io.BytesIO(data)):
+            data = _decrypt_excel(data, password)
+        total_sheets, locked_sheets, unlocked_sheets = _excel_sheet_counts(data)
+        unlocked = _remove_excel_protection(data)
+    except RuntimeError as cause:
+        raise HTTPException(status_code=503, detail=str(cause)) from cause
+    except ValueError as cause:
+        raise HTTPException(status_code=400, detail=str(cause)) from cause
+
+    base_name = Path(original_name).stem[:80]
+    safe_name = re.sub(r"[^A-Za-z0-9._ -]+", "-", base_name).strip(" .-") or "workbook"
+    download_name = f"{safe_name}-unlocked{suffix}"
+    return Response(
+        content=unlocked,
+        media_type=EXCEL_MEDIA_TYPES[suffix],
+        headers={
+            "Content-Disposition": f'attachment; filename="{download_name}"',
+            "Cache-Control": "no-store",
+            "X-Protection-Removed": "1",
+            "X-Excel-Total-Sheets": str(total_sheets),
+            "X-Excel-Locked-Sheets": str(locked_sheets),
+            "X-Excel-Unlocked-Sheets": str(unlocked_sheets),
+        },
+    )
 @app.post("/api/convert-image")
 async def convert_image(file: UploadFile = File(...), target: str = "image/png"):
     content_type = (file.content_type or "").lower()

@@ -8,3 +8,7 @@ pillow-heif==1.1.1
 # rembg brings the ONNX model plumbing; onnxruntime is the CPU inference engine.
 rembg==2.0.61
 onnxruntime==1.19.2
+
+# Office encryption and OOXML package editing for the Excel unlocker.
+msoffcrypto-tool>=5.4,<6
+lxml>=5.3,<6

@@ -9,3 +9,5 @@ venv/
 
 # VPS-only deployment settings
 .deploy.conf
+data/*.sqlite3
+data/*.sqlite3-*

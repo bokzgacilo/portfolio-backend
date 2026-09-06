@@ -20,6 +20,13 @@ pass so one oversized upload cannot exhaust a small instance.
 `POST /api/remove-background` takes `multipart/form-data` with the image under
 the field name **`file`**. JPG, PNG, and WebP are accepted.
 
+`POST /api/unlock-excel` takes an `.xlsx` or `.xlsm` workbook under **`file`**
+and an optional `password` form field. It removes worksheet and workbook
+protection, preserves the rest of the OOXML package (including VBA projects in
+`.xlsm` files), and returns the unlocked workbook as an attachment. Encrypted
+files still require their open password. Uploads are processed in memory and
+not stored.
+
 On success the response carries a receipt in its headers, all of them exposed
 to browser JavaScript through CORS:
 
@@ -52,6 +59,7 @@ Every variable has a working default; none are required.
 | `REMBG_MODEL`         | `u2netp`                               | `isnet-general-use` or `u2net` for better edges (more RAM) |
 | `MAX_UPLOAD_BYTES`    | `10485760` (10 MB)                     | Rejected with `413` above this                            |
 | `MAX_DIMENSION`       | `2000`                                 | Longest edge; larger inputs are downscaled first          |
+| `EXCEL_MAX_UPLOAD_BYTES` | `52428800` (50 MB)                  | Excel workbook upload cap                                  |
 | `ALLOWED_ORIGINS`     | production domains only                 | Comma-separated                                          |
 | `ALLOWED_ORIGIN_REGEX`| empty                                   | Optional regex for non-production preview origins         |
 | `STRICT_ORIGIN_CHECK` | `1`                                     | Rejects `/api/remove-background` when `Origin` is not allowed |
@@ -162,3 +170,18 @@ can interrupt in-flight requests, so use a quiet moment for updates.
 
 This is a manually triggered deployment command, not a push-triggered CI pipeline.
 It does not upgrade the VPS operating system or the `cloudflared` binary.
+
+## Statistics storage
+
+Tool and blog counters are stored by this FastAPI service in SQLite. The
+default database path is `/opt/api/data/statistics.sqlite3`; override it with
+`STATISTICS_DB_PATH` in the systemd service if needed. The database and tables
+are created automatically when the API starts. No Supabase table or Storage
+bucket is required for statistics.
+
+The API exposes `GET /api/statistics` for aggregate counters and
+`POST /api/statistics` for validated events. The database stores anonymous
+random browser identifiers, resource keys, event types, event IDs, and
+timestamps. It does not store uploaded files or filenames. The database is
+ignored by Git and should be backed up separately if you need historical
+statistics.

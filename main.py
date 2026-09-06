@@ -23,6 +23,7 @@ import tempfile
 import time
 import zipfile
 from contextlib import asynccontextmanager
+from functools import lru_cache
 from pathlib import Path
 from uuid import UUID
 
@@ -344,12 +345,36 @@ def _safe_download_stem(filename: str | None, default: str) -> str:
     return re.sub(r"[^A-Za-z0-9._ -]+", "-", base_name).strip(" .-") or default
 
 
+@lru_cache(maxsize=8)
+def _ffmpeg_encoder_available(ffmpeg_path: str, encoder: str) -> bool:
+    try:
+        result = subprocess.run(
+            [ffmpeg_path, "-hide_banner", "-encoders"],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return any(len(parts := line.split()) > 1 and parts[1] == encoder for line in result.stdout.splitlines())
+
+
+def _audio_ffmpeg_args(ffmpeg_path: str, target: str) -> list[str]:
+    args = list(AUDIO_OUTPUT_FORMATS[target]["ffmpeg_args"])
+    if target == "ogg" and "libvorbis" in args and not _ffmpeg_encoder_available(ffmpeg_path, "libvorbis"):
+        if _ffmpeg_encoder_available(ffmpeg_path, "libopus"):
+            return ["-codec:a", "libopus", "-b:a", "128k"]
+        args[args.index("libvorbis")] = "vorbis"
+        args.extend(["-strict", "experimental"])
+    return args
+
+
 def _convert_audio_file(input_path: Path, output_path: Path, target: str) -> None:
     ffmpeg_path = shutil.which("ffmpeg")
     if ffmpeg_path is None:
         raise RuntimeError("Audio conversion is not installed on the server.")
 
-    format_config = AUDIO_OUTPUT_FORMATS[target]
     command = [
         ffmpeg_path,
         "-y",
@@ -359,7 +384,7 @@ def _convert_audio_file(input_path: Path, output_path: Path, target: str) -> Non
         "-i",
         str(input_path),
         "-vn",
-        *format_config["ffmpeg_args"],
+        *_audio_ffmpeg_args(ffmpeg_path, target),
         str(output_path),
     ]
     try:

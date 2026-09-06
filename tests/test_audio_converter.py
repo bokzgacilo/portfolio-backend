@@ -3,6 +3,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
+from subprocess import CompletedProcess
 
 from fastapi import HTTPException, UploadFile
 
@@ -91,6 +92,27 @@ class AudioConverterTests(unittest.TestCase):
             error = self.assert_http_error(400, "song.wav", b"fake audio", "audio/wav", "mp3")
 
         self.assertEqual(error, "Invalid data found when processing input")
+
+    def test_ogg_falls_back_to_builtin_vorbis_encoder(self):
+        with patch.object(main, "_ffmpeg_encoder_available", side_effect=[False, False]):
+            self.assertEqual(
+                main._audio_ffmpeg_args("/usr/bin/ffmpeg", "ogg"),
+                ["-codec:a", "vorbis", "-q:a", "5", "-strict", "experimental"],
+            )
+
+    def test_ogg_prefers_libopus_before_experimental_vorbis(self):
+        with patch.object(main, "_ffmpeg_encoder_available", side_effect=[False, True]):
+            self.assertEqual(
+                main._audio_ffmpeg_args("/usr/bin/ffmpeg", "ogg"),
+                ["-codec:a", "libopus", "-b:a", "128k"],
+            )
+
+    def test_encoder_detection_reads_ffmpeg_encoder_name_column(self):
+        main._ffmpeg_encoder_available.cache_clear()
+        output = " A....D libopus Opus (codec opus)\n A....D aac AAC (Advanced Audio Coding)\n"
+        with patch.object(main.subprocess, "run", return_value=CompletedProcess([], 0, output, "")):
+            self.assertTrue(main._ffmpeg_encoder_available("/usr/bin/ffmpeg", "libopus"))
+            self.assertFalse(main._ffmpeg_encoder_available("/usr/bin/ffmpeg", "libvorbis"))
 
 
 if __name__ == "__main__":

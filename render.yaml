@@ -10,6 +10,7 @@ services:
     # The model is fetched during the build, so the first live request does not
     # pay for a 5 MB download on top of inference.
     buildCommand: |
+      apt-get update && apt-get install -y ffmpeg
       pip install --upgrade pip
       pip install -r requirements.txt
       python -c "from rembg import new_session; import os; new_session(os.getenv('REMBG_MODEL', 'u2netp'))"

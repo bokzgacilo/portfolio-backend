@@ -33,6 +33,7 @@ from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
+import yt_dlp
 from PIL import Image, ImageOps, UnidentifiedImageError
 from pillow_heif import register_heif_opener
 from rembg import new_session, remove
@@ -118,6 +119,7 @@ STATISTICS_RESOURCES = (
     ("tool/converter/pdf-to-image", "tool"),
     ("tool/data/json-formatter", "tool"),
     ("tool/data/excel-unlocker", "tool"),
+    ("tool/video/youtube-downloader", "tool"),
     ("blog/integrating-salesforce-crm-leads-with-a-next-js-page-router-app-7b29bac20ea9", "blog"),
 )
 
@@ -169,6 +171,17 @@ AUDIO_OUTPUT_FORMATS = {
         "ffmpeg_args": ["-codec:a", "aac", "-b:a", "192k"],
     },
 }
+
+# Longest video the downloader will process. A free-tier instance has no
+# business transcoding a two-hour video; this also bounds worst-case memory
+# and request time.
+YOUTUBE_MAX_DURATION_SECONDS = _int_env("YOUTUBE_MAX_DURATION_SECONDS", 1800)
+YOUTUBE_URL_RE = re.compile(
+    r"^https?://(www\.|m\.)?(youtube\.com/(watch\?v=|shorts/)|youtu\.be/)[\w-]{6,}",
+    re.IGNORECASE,
+)
+YOUTUBE_FORMATS = {"mp3", "mp4"}
+
 _statistics_error: str | None = None
 
 
@@ -397,6 +410,40 @@ def _convert_audio_file(input_path: Path, output_path: Path, target: str) -> Non
             message = message.splitlines()[-1][:180]
         raise ValueError(message or "That file could not be converted.") from cause
 
+
+def _validate_youtube_url(url: str | None) -> str:
+    url = (url or "").strip()
+    if not url or not YOUTUBE_URL_RE.match(url):
+        raise HTTPException(status_code=400, detail="Enter a valid YouTube video URL.")
+    return url
+
+
+async def _read_json_body(request: Request) -> dict:
+    try:
+        body = json.loads((await request.body()).decode("utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError) as cause:
+        raise HTTPException(status_code=400, detail="Send a JSON request body.") from cause
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="Send a JSON request body.")
+    return body
+
+
+def _youtube_ydl_opts(ffmpeg_path: str, **overrides) -> dict:
+    opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "noplaylist": True,
+        "socket_timeout": 20,
+        "retries": 2,
+        "ffmpeg_location": ffmpeg_path,
+        # The default "web" client alone increasingly returns formats that need
+        # a PO token; falling back through android buys compatibility without
+        # one, at the cost of some resolutions being unavailable.
+        "extractor_args": {"youtube": {"player_client": ["android", "web"]}},
+    }
+    opts.update(overrides)
+    return opts
+
 # --------------------------------------------------------------------------- #
 # App                                                                         #
 # --------------------------------------------------------------------------- #
@@ -462,6 +509,9 @@ app.add_middleware(
         "X-Audio-Source-Format",
         "X-Audio-Output-Format",
         "X-Audio-Output-Bytes",
+        "X-Youtube-Output-Format",
+        "X-Youtube-Output-Bytes",
+        "X-Youtube-Duration-Seconds",
     ],
 )
 
@@ -474,6 +524,8 @@ async def enforce_api_origin(request, call_next):
         "/api/statistics",
         "/api/unlock-excel",
         "/api/convert-audio",
+        "/api/youtube/info",
+        "/api/youtube/download",
     }
     if STRICT_ORIGIN_CHECK and request.url.path in protected_paths:
         origin = request.headers.get("origin")
@@ -495,6 +547,8 @@ def root():
             "convert": "POST /api/convert-image",
             "convertAudio": "POST /api/convert-audio",
             "unlockExcel": "POST /api/unlock-excel",
+            "youtubeInfo": "POST /api/youtube/info",
+            "youtubeDownload": "POST /api/youtube/download",
         },
         "limits": {
             "maxUploadBytes": MAX_UPLOAD_BYTES,
@@ -507,6 +561,8 @@ def root():
             "audioMaxUploadBytes": AUDIO_MAX_UPLOAD_BYTES,
             "audioInputExtensions": sorted(AUDIO_INPUT_EXTENSIONS),
             "audioOutputFormats": sorted(AUDIO_OUTPUT_FORMATS),
+            "youtubeMaxDurationSeconds": YOUTUBE_MAX_DURATION_SECONDS,
+            "youtubeFormats": sorted(YOUTUBE_FORMATS),
         },
     }
 
@@ -656,6 +712,119 @@ async def convert_audio(file: UploadFile = File(...), target: str = Form("mp3"))
             "X-Audio-Source-Format": content_type or suffix.lstrip(".") or "unknown",
             "X-Audio-Output-Format": target,
             "X-Audio-Output-Bytes": str(len(payload)),
+        },
+    )
+
+
+@app.post("/api/youtube/info")
+async def youtube_info(request: Request):
+    """Look up a YouTube video's title/thumbnail/duration without downloading."""
+    body = await _read_json_body(request)
+    url = _validate_youtube_url(body.get("url"))
+
+    ffmpeg_path = shutil.which("ffmpeg") or ""
+    try:
+        with yt_dlp.YoutubeDL(_youtube_ydl_opts(ffmpeg_path, skip_download=True)) as ydl:
+            info = ydl.extract_info(url, download=False)
+    except yt_dlp.utils.DownloadError as cause:
+        raise HTTPException(
+            status_code=422,
+            detail="Could not read that video. It may be private, age-restricted, or unavailable.",
+        ) from cause
+
+    duration = int(info.get("duration") or 0)
+    return {
+        "title": info.get("title") or "video",
+        "thumbnail": info.get("thumbnail"),
+        "channel": info.get("uploader"),
+        "durationSeconds": duration,
+        "tooLong": duration > YOUTUBE_MAX_DURATION_SECONDS,
+        "maxDurationSeconds": YOUTUBE_MAX_DURATION_SECONDS,
+    }
+
+
+@app.post("/api/youtube/download")
+async def youtube_download(request: Request):
+    """Download a YouTube video as MP4 (<=720p) or extract it as MP3."""
+    body = await _read_json_body(request)
+    url = _validate_youtube_url(body.get("url"))
+    target = str(body.get("format") or "").strip().lower()
+    if target not in YOUTUBE_FORMATS:
+        raise HTTPException(status_code=415, detail="Choose mp3 or mp4 as the format.")
+
+    ffmpeg_path = shutil.which("ffmpeg")
+    if ffmpeg_path is None:
+        raise HTTPException(status_code=503, detail="Video conversion is not installed on the server.")
+
+    # Duration is re-checked server-side even though the frontend already
+    # screened it via /api/youtube/info -- that check is only a UI hint.
+    try:
+        with yt_dlp.YoutubeDL(_youtube_ydl_opts(ffmpeg_path, skip_download=True)) as ydl:
+            probe = ydl.extract_info(url, download=False)
+    except yt_dlp.utils.DownloadError as cause:
+        raise HTTPException(
+            status_code=422,
+            detail="Could not read that video. It may be private, age-restricted, or unavailable.",
+        ) from cause
+
+    duration = int(probe.get("duration") or 0)
+    if duration > YOUTUBE_MAX_DURATION_SECONDS:
+        limit_minutes = YOUTUBE_MAX_DURATION_SECONDS // 60
+        raise HTTPException(status_code=413, detail=f"That video is longer than the {limit_minutes}-minute limit.")
+
+    with tempfile.TemporaryDirectory(prefix="youtube-dl-") as directory:
+        workspace = Path(directory)
+        output_template = str(workspace / "download.%(ext)s")
+        if target == "mp3":
+            ydl_opts = _youtube_ydl_opts(
+                ffmpeg_path,
+                format="bestaudio/best",
+                outtmpl=output_template,
+                postprocessors=[
+                    {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"}
+                ],
+            )
+        else:
+            ydl_opts = _youtube_ydl_opts(
+                ffmpeg_path,
+                format="bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720][ext=mp4]/best[height<=720]",
+                outtmpl=output_template,
+                merge_output_format="mp4",
+            )
+
+        started = time.perf_counter()
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+        except yt_dlp.utils.DownloadError as cause:
+            raise HTTPException(
+                status_code=422,
+                detail="Could not download that video. It may be private, age-restricted, or unavailable.",
+            ) from cause
+        elapsed_ms = int((time.perf_counter() - started) * 1000)
+
+        produced = sorted(workspace.glob("download.*"))
+        if not produced:
+            raise HTTPException(status_code=500, detail="The download produced no output file.")
+        payload = produced[-1].read_bytes()
+
+    if not payload:
+        raise HTTPException(status_code=500, detail="The download produced an empty file.")
+
+    extension = "mp3" if target == "mp3" else "mp4"
+    media_type = "audio/mpeg" if target == "mp3" else "video/mp4"
+    safe_name = _safe_download_stem(info.get("title"), "video")
+    download_name = f"{safe_name}.{extension}"
+    return Response(
+        content=payload,
+        media_type=media_type,
+        headers={
+            "Content-Disposition": f'attachment; filename="{download_name}"',
+            "Cache-Control": "no-store",
+            "X-Processing-Ms": str(elapsed_ms),
+            "X-Youtube-Output-Format": target,
+            "X-Youtube-Output-Bytes": str(len(payload)),
+            "X-Youtube-Duration-Seconds": str(duration),
         },
     )
 

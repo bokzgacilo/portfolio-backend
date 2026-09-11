@@ -37,3 +37,5 @@ services:
         value: ""
       - key: STRICT_ORIGIN_CHECK
         value: "1"
+      - key: YOUTUBE_MAX_DURATION_SECONDS
+        value: "1800"

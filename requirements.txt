@@ -12,3 +12,7 @@ onnxruntime==1.19.2
 # Office encryption and OOXML package editing for the Excel unlocker.
 msoffcrypto-tool>=5.4,<6
 lxml>=5.3,<6
+
+# YouTube extraction for the video/mp3 downloader. Unpinned minor/patch: YouTube
+# changes its player frequently and yt-dlp ships frequent fixes for it.
+yt-dlp>=2024.12.0

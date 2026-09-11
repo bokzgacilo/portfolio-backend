@@ -445,6 +445,10 @@ def _youtube_ydl_opts(ffmpeg_path: str, **overrides) -> dict:
         # clients currently least likely to demand sign-in; "web" stays last as
         # a broad-compatibility fallback.
         "extractor_args": {"youtube": {"player_client": ["tv", "ios", "android", "web"]}},
+        # YouTube's signature/n-parameter challenges now require running a bit
+        # of their JS; yt-dlp solves it with a local runtime (Deno) plus a
+        # small solver script it fetches from yt-dlp-ejs on first use.
+        "remote_components": ["ejs:github"],
     }
     if YOUTUBE_COOKIES_FILE:
         opts["cookiefile"] = YOUTUBE_COOKIES_FILE

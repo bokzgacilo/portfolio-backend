@@ -428,6 +428,9 @@ async def _read_json_body(request: Request) -> dict:
     return body
 
 
+YOUTUBE_COOKIES_FILE = os.getenv("YOUTUBE_COOKIES_FILE") or None
+
+
 def _youtube_ydl_opts(ffmpeg_path: str, **overrides) -> dict:
     opts = {
         "quiet": True,
@@ -437,10 +440,14 @@ def _youtube_ydl_opts(ffmpeg_path: str, **overrides) -> dict:
         "retries": 2,
         "ffmpeg_location": ffmpeg_path,
         # The default "web" client alone increasingly returns formats that need
-        # a PO token; falling back through android buys compatibility without
-        # one, at the cost of some resolutions being unavailable.
-        "extractor_args": {"youtube": {"player_client": ["android", "web"]}},
+        # a PO token or trips YouTube's bot check, which datacenter IPs (like a
+        # VPS) hit far more often than home connections. "tv" and "ios" are the
+        # clients currently least likely to demand sign-in; "web" stays last as
+        # a broad-compatibility fallback.
+        "extractor_args": {"youtube": {"player_client": ["tv", "ios", "android", "web"]}},
     }
+    if YOUTUBE_COOKIES_FILE:
+        opts["cookiefile"] = YOUTUBE_COOKIES_FILE
     opts.update(overrides)
     return opts
 

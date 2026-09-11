@@ -15,4 +15,4 @@ lxml>=5.3,<6
 
 # YouTube extraction for the video/mp3 downloader. Unpinned minor/patch: YouTube
 # changes its player frequently and yt-dlp ships frequent fixes for it.
-yt-dlp>=2024.12.0
+yt-dlp>=2025.10.14

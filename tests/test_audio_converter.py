@@ -1,4 +1,5 @@
 import asyncio
+import importlib
 import tempfile
 import unittest
 from pathlib import Path
@@ -7,7 +8,10 @@ from subprocess import CompletedProcess
 
 from fastapi import HTTPException, UploadFile
 
-import main
+# service.audio_converter.__init__ re-exports its APIRouter instance under
+# the name "router", which shadows the submodule of the same name on the
+# package object -- import_module reaches the actual submodule regardless.
+main = importlib.import_module("service.audio_converter.router")
 
 
 class AudioConverterTests(unittest.TestCase):

@@ -12,3 +12,4 @@ venv/
 *cookies*.txt
 data/*.sqlite3
 data/*.sqlite3-*
+data/youtube-downloads/

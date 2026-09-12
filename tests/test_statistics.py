@@ -10,10 +10,19 @@ class StatisticsStorageTests(unittest.TestCase):
     def setUpClass(cls):
         cls.directory = tempfile.TemporaryDirectory()
         os.environ["STATISTICS_DB_PATH"] = str(Path(cls.directory.name) / "statistics.sqlite3")
-        import main
+        from service import common
 
-        cls.main = importlib.reload(main)
-        main._init_statistics_db()
+        # service.statistics.__init__ re-exports its APIRouter instance under
+        # the name "router", which shadows the submodule of the same name on
+        # the package object -- import_module reaches the actual submodule.
+        statistics = importlib.import_module("service.statistics.router")
+
+        # STATISTICS_DB_PATH is read once at import time, so both the shared
+        # connection helper and the statistics router need reloading after
+        # the env var above is set, or they'd keep using the default path.
+        importlib.reload(common)
+        cls.main = importlib.reload(statistics)
+        cls.main.init_db()
 
     @classmethod
     def tearDownClass(cls):

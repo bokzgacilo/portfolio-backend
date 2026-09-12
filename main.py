@@ -12,9 +12,10 @@ Run on Render: uvicorn main:app --host 0.0.0.0 --port $PORT
 
 from __future__ import annotations
 
+import time
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -28,7 +29,16 @@ from service import (
     statistics,
     youtube_downloader,
 )
-from service.common import ALLOWED_ORIGIN_REGEX, ALLOWED_ORIGINS, STRICT_ORIGIN_CHECK
+from service.common import (
+    ALLOWED_ORIGIN_REGEX,
+    ALLOWED_ORIGINS,
+    STRICT_ORIGIN_CHECK,
+    client_ip,
+    configure_logging,
+    logger,
+)
+
+configure_logging()
 
 PROTECTED_PATHS = (
     background_remover.PROTECTED_PATHS
@@ -93,6 +103,24 @@ async def enforce_api_origin(request, call_next):
             return JSONResponse(status_code=403, content={"error": "Origin not allowed."})
 
     return await call_next(request)
+
+
+# Registered after enforce_api_origin so it ends up OUTERMOST in Starlette's
+# middleware stack (the last @app.middleware("http") added wraps every one
+# before it) -- that way it logs every request, including ones the origin
+# check rejects with 403 before they ever reach a route.
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    started = time.perf_counter()
+    try:
+        response = await call_next(request)
+    except Exception:
+        elapsed_ms = (time.perf_counter() - started) * 1000
+        logger.exception("%s %s -> unhandled exception after %.1fms [%s]", request.method, request.url.path, elapsed_ms, client_ip(request))
+        raise
+    elapsed_ms = (time.perf_counter() - started) * 1000
+    logger.info("%s %s -> %s in %.1fms [%s]", request.method, request.url.path, response.status_code, elapsed_ms, client_ip(request))
+    return response
 
 
 app.include_router(background_remover.router)

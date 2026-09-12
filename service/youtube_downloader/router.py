@@ -27,7 +27,7 @@ from uuid import uuid4
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import Response
 
-from service.common import int_env, read_json_body, safe_download_stem, statistics_connection
+from service.common import int_env, logger, read_json_body, safe_download_stem, statistics_connection
 
 # Longest video the downloader will process. A free-tier instance has no
 # business transcoding a two-hour video; this also bounds worst-case memory
@@ -123,6 +123,10 @@ def _run_yt_dlp(args: list[str], *, timeout: int) -> subprocess.CompletedProcess
     if YOUTUBE_COOKIES_FILE:
         command += ["--cookies", YOUTUBE_COOKIES_FILE]
     command += ["--extractor-args", "youtube:player_client=tv,ios,android,web"]
+    # A URL copied from a playlist/radio/mix (?list=...&start_radio=1) would
+    # otherwise make yt-dlp try to resolve the whole list instead of the one
+    # video, which can run well past the request timeout.
+    command += ["--no-playlist"]
     command += args
     return subprocess.run(command, capture_output=True, text=True, timeout=timeout)
 
@@ -225,6 +229,11 @@ async def youtube_info(request: Request):
     try:
         info = await _run_yt_dlp_exclusive(_fetch_info, url)
     except (ValueError, RuntimeError) as cause:
+        # The client only gets a generic message -- it may quote back
+        # anything yt-dlp printed, including account/session details -- so
+        # the real reason (bot check, expired cookies, private video, ...)
+        # only survives here in the log.
+        logger.warning("youtube info failed for %s: %s", url, cause)
         raise HTTPException(
             status_code=422,
             detail="Could not read that video. It may be private, age-restricted, or unavailable.",
@@ -296,6 +305,7 @@ async def youtube_download(request: Request):
     try:
         tmp_file = await _run_yt_dlp_exclusive(_download_video, job["url"], job_id, target, ffmpeg_path)
     except (ValueError, RuntimeError) as cause:
+        logger.warning("youtube download failed for %s (%s): %s", job["url"], target, cause)
         raise HTTPException(
             status_code=422,
             detail="Could not download that video. It may be private, age-restricted, or unavailable.",

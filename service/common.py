@@ -7,12 +7,43 @@ router.py instead -- keep this file small so it stays easy to scan.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import sqlite3
+import sys
 from pathlib import Path
 
 from fastapi import HTTPException, Request
+
+logger = logging.getLogger("api")
+
+
+def configure_logging() -> None:
+    """Plain stdout logging -- systemd/journalctl captures it as-is, and
+    Render/uvicorn's own stdout capture works the same way. Call once at
+    startup; safe to call more than once (idempotent)."""
+    if logger.handlers:
+        return
+    level = os.getenv("LOG_LEVEL", "INFO").upper()
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    logger.addHandler(handler)
+    logger.setLevel(level)
+    logger.propagate = False
+
+
+def client_ip(request: Request) -> str:
+    """Best-effort real client IP. The API sits behind a Cloudflare tunnel, so
+    request.client.host is the tunnel daemon's loopback address, not the
+    visitor -- prefer the headers Cloudflare actually sets."""
+    forwarded = request.headers.get("cf-connecting-ip")
+    if forwarded:
+        return forwarded
+    forwarded = request.headers.get("x-forwarded-for")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    return request.client.host if request.client else "-"
 
 
 def int_env(name: str, default: int) -> int:
